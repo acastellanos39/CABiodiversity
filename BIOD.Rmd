@@ -1,0 +1,1363 @@
+---
+title: "Chapter 3"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = F, results = "hide"}
+packages <- c("ape", "seqinr", "foreach", "rgdal", "raster", "maptools", "raster", "rgeos", "picante", "viridis", "ggplot2", "sf", "tidyverse", "magrittr", "fasterize", "spgwr", "cowplot", "glmulti", "gbm", "randomForest", "dismo", "ncf", "spdep", "parallel", "doSNOW", "Metrics")
+#lapply(packages, install.packages)
+lapply(packages, library, character.only = T)
+source("~/Desktop/BIOD/FixedPhyloDiversityCode.R")
+```
+# Data wrangling 
+This is a tree of 5,020 mammal species from **S.A. Fritz et al. 2009. Ecology Letters. Geographical variation in predictors of mammalian extinction risk: Big is bad, but only in the tropics**
+And these are range maps in the form of polygons for all terrestrial mammal species on IUCN
+```{r}
+TREE <- read.nexus("ELE_1307_sm_SA1.nex")
+POLY <- st_read(dsn = "TERRESTRIAL_MAMMALS.shp")
+```
+
+Cleaning up the spatial data: 1) grab study extent, 2) crop mammal ranges to this extent, 3) get polygons for all political boundaries in study extent (so add in Mexico and Colombia) and remove the ranges that dont fit in them (remove Caribbean and other islands).
+```{r}
+CNTRY <- c("BLZ", "CRI", "GTM", "HND", "NIC", "PAN", "SLV")
+BORD <- lapply(CNTRY, function(x) raster::getData(country = x, level = 0))
+BORD <- do.call(bind, BORD)
+EXT <- extent(c(BORD@bbox[, 1] - 2, BORD@bbox[, 2] + 2)[c(1, 3, 2, 4)])
+RANGE <- st_crop(POLY, EXT)
+CNTRY <- c("MEX", "COL", "BLZ", "CRI", "GTM", "HND", "NIC", "PAN", "SLV")
+BORD <- lapply(CNTRY, function(x) raster::getData(country = x, level = 0))
+BORD <- do.call(bind, BORD)
+OVR <- sp::over(as(RANGE, "Spatial"), BORD)
+RANGE <- RANGE[-which(is.na(OVR[, 1])), ]
+RANGE
+```
+
+Determine resolution and make community matrix to use with biodiversity indices
+```{r}
+RAST <- raster(as(RANGE, "Spatial"), res = 0.2083333)
+```
+
+Create community matrix. Briefly, create number of rows equalling the number of cells and columns as the number of species. Use the `over` function to determine which polygons intersect each cell and determine presence/absence.
+```{r,eval = F}
+RASP <- rasterToPolygons(RAST) #turn raster into polygons for use with the over function
+SAMP <- matrix(0, nrow = length(RASP), ncol = length(RANGE$binomial)) #creates an empty matrix with rows as "sites" and columns as species
+row.names(SAMP) <- 1:length(RASP)
+colnames(SAMP) <- RANGE$binomial
+RANGE <- as(RANGE, "Spatial")
+for(i in 1:length(RANGE$binomial)) {
+	OVER <- over(RASP, RANGE[RANGE$binomial %in% RANGE$binomial[i], ]) 
+	SAMP[which(!is.na(OVER$binomial)), as.character(RANGE$binomial[i])] <- 1 
+}
+#uses the over function to determine species presence in each row
+SAMP <- SAMP[, unique(colnames(SAMP))] #these data are multipolygons in some instances, so you have repeated columns that don't have any info
+#write.csv(SAMP, "CACommunityMatrix25km.csv", row.names = F)
+```
+Read in the community matrix and remove those species that are not found in the phylogenetic tree. Also calculate SR from the community matrix to  make things comparable with the other indices.
+```{r}
+SAMP <- read.csv("~/Desktop/BIOD/CACommunityMatrix25km.csv", header = T)
+colnames(SAMP) <- sapply(colnames(SAMP), function(X) paste(unlist(strsplit(X, "[.]")), collapse = "_"), USE.NAMES = F) #changes species names in the community matrix to match with the tree tip names
+setdiff(colnames(SAMP), TREE$mammalST_MSW05_bestDates$tip.label)#59 species are not found in the tree
+SAMP <- SAMP[, colnames(SAMP)[!colnames(SAMP) %in% setdiff(colnames(SAMP), TREE$mammalST_MSW05_bestDates$tip.label)]] #only grabs the column names that have phylogenetic information as well
+SRA <- RAST
+SRA[] <- rowSums(SAMP)
+SRA[SRA == 0] <- NA
+```
+
+Grab function for PD, PE, WE from another source (read in at the beginning) and calculate each
+```{r, fig.height= 10, fig.width= 14, warning = F, message = F}
+PD <- phylogenetic.endemism(data.frame(SAMP), records = "site", site.coords = coordinates(RAST), longitude = "x", latitude = "y", sep.comm.spp = "_", phylo.tree = TREE$mammalST_MSW05_bestDates, sep.phylo.spp = "_", frame.raster = RAST, pe.type = "unweighted", plot.raster = F)
+
+PE <- phylogenetic.endemism(data.frame(SAMP), records = "site", site.coords = coordinates(RAST), longitude = "x", latitude = "y", sep.comm.spp = "_", phylo.tree = TREE$mammalST_MSW05_bestDates, sep.phylo.spp = "_", frame.raster = RAST, pe.type = "weighted", plot.raster = F)
+
+WE <- weighted.endemism(data.frame(SAMP), records = "site", site.coords = coordinates(RAST), species = colnames(SAMP), longitude = "x", latitude = "y", frame.raster = RAST, plot.raster = F)
+
+PLT <- lapply(list(SRA, PD$PD_raster, PE$PD_raster, WE$WE_raster), function(x) x %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = PLT, nrow = 2, labels = c("SR", "PD", "PE", "WE"))
+
+layerStats(stack(SRA, PD$PD_raster, PE$PD_raster, WE$WE_raster), "pearson", na.rm = T)
+```
+
+Biodiversity indices show lots of overlap (SR with PD and PE with WE), which may suggest that there is a pretty evenly distributed community (taxonomically wise)
+
+# Species richness - all mammals {.tabset}
+## Variables
+Get the variables ready. Will be using a variety of bioclim variables (annual temp, precip, seasonality of temp and precip), distance to water from each cell, cation exchange coefficient, a continuous landcover variable for forest presence, model results of forest stability, average net primary productivity (from 2000-2014), mean elevation, mean slope, mean Topographic Ruggedness Index, and mean roughness. Some things to think about: 1) need to remove correlated variables, 2) add more soil variables? Are there other good ones at a reasonable scale out there? 3) should I add in median or standard deviation of the elevation variables (what is the topographic heterogeneity like)
+
+```{r, fig.height= 30, fig.width = 18}
+PRED <- list.files("~/Desktop/SDM/wc2-5", pattern = "bil", full.names = T)[c(1, 4, 7, 12:14)]
+PRED <- raster::stack(PRED)
+DIST <- raster("dist_water_meters.tif")
+CEC <- raster("CECSOL_M_sl2_250m.tif")
+STAB <- raster("foreststability_static.tif")
+DYN <- raster("foreststability_dynamic.tif")
+ELEV <- raster("elevation_1KMmn_GMTEDmn.tif")
+SLPE <- raster("slope_1KMmn_GMTEDmd.tif")
+TRI <- raster("tri_1KMmn_SRTM.tif")
+RGH <- raster("roughness_1KMmn_GMTEDmd.tif")
+ENLF <- raster("consensus_full_class_1.tif") #Evergreen needleleaf proportional forest cover at 1km global scale
+EBLF <- raster("consensus_full_class_2.tif") #Evergreen broadleaf proportional forest cover at 1km global scale
+FRST <- ENLF + EBLF
+NPP <- raster("meanNPP.tif")
+LIST <- list(PRED, DIST, CEC, STAB, DYN, FRST, NPP, ELEV, SLPE, TRI, RGH)
+VARS <- lapply(1:11, function(x) raster::resample(crop(LIST[[x]], EXT), SRA, method = "bilinear"))
+VARS <- raster::stack(VARS)
+names(VARS) <- c("bio1", "bio12", "bio15", "bio2", "bio3", "bio4", "distwater", "CEC", "staticforest", "dynforest", "forest", "npp", "elev", "slope", "tri", "roughness")
+var <- lapply(1:16, function(x) VARS[[x]] %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = .[ ,3])) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = var, nrow = 6, labels = names(VARS))
+```
+
+## GLM
+Create the models. Check out a model using all the variables and a histogram of SR. 
+```{r}
+DATA <- cbind.data.frame(coordinates(VARS), sr = getValues(SRA), getValues(VARS))
+DATA <- DATA[-which(is.na(DATA$sr)), ]
+DATA %>% ggplot(aes(sr)) + geom_density()
+```
+
+Histogram shows a mostly normal-ish distribution with outliers caused by islands and other things.
+
+Use `glmulti` to use all subsets variable selection. May need to check out the degrees of freedom used and adjust the number of variables able to be considered per model.
+```{r, results = "hide", message = F}
+rownames(DATA) <- 1:nrow(DATA)
+set.seed(3)
+DATA %<>% mutate(fold = kfold(DATA, k = 5))
+TEST <- DATA %>% filter(fold == 5)
+```
+```{r, eval = F}
+cl <- makeCluster(4, "SOCK")
+registerDoSNOW(cl)
+OUT <- foreach(i = 1:4, .packages = c("tidyverse", "glmulti", "Metrics"), .export = "DATA") %do% {
+TRAIN <- DATA %>% dplyr::filter(fold != i & fold != 5)
+VALID <- DATA %>% dplyr::filter(fold == i)
+lmout <- glmulti::glmulti(sr ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = TRAIN, level = 1, crit = "aicc", confsetsize = 5, method = "h", plotty = F, report = F)
+pred <- lapply(1:length(lmout@objects), function(x) predict(lmout@objects[[x]], VALID))
+RME <- sapply(pred, function(x) rmse(VALID$sr[-which(is.na(x))], x[-which(is.na(x))]))
+cbind(weightable(lmout), RME)
+}
+OUT
+unique(sapply(OUT, "[[", 1)[1, ])
+#`level = 1` means that only main level interactions are considered, `crit = "aic"` means it is comparing models using AIC, `method = "h"` means it considers all models, and `confsetsize = 5` means to return only the top 5 models
+```
+Looks like all variables considered is considered the best model (probably some level of overfitting, I'd imagine). Take a look at the spatial patterns of residuals
+```{r, fig.width = 12, fig.height = 10}
+TST <- predict(glm(sr ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = DATA %>% filter(fold != 5)), TEST) 
+RME <- rmse(TEST$sr[-which(is.na(TST))], TST[-which(is.na(TST))])
+RME
+DATA %<>% mutate(block = kfold(DATA, k = 4))
+DIFG <- foreach(i = 1:4, .combine = "rbind") %do% {
+  TRAIN <- DATA %>% filter(block != i)
+  TEST <- DATA %>% filter(block == i)
+  GLM <- glm(sr ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = TRAIN)
+  pred <- predict(GLM, TEST)
+  TEST %>% select(x, y, sr) %>% mutate(diff = sr - pred)
+}
+DIFG %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+GLM <- glm(sr ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = DATA)
+summary(GLM)
+balt <- DATA %>% mutate(residuals = NA)
+balt[names(GLM$residuals), "residuals"] <- GLM$residuals
+balt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+
+## Spatial Regression Models (`package::spdep`)
+Take a look at spatial correlelograms for the residuals over a variety of distance classes (can see distinct spatial autocorrelation at lower distance classes). Then use `knearneigh` with a k = 1 to find minimum distance between neighbors to use that in `dnearneigh`. This is used to create a spatial regression model of the best determined model as determined by `glmulti`.
+```{r, fig.width = 12, fig.height = 10, warning=F}
+COR <- correlog(x = balt$x, y = balt$y, z = balt$residuals, increment = 10, resamp = 100, latlon = T, na.rm = T)
+plot(COR)
+KNN <- knearneigh(as.matrix(balt[, 1:2]), longlat = T)
+DIST <- sapply(1:length(KNN$nn), function(x) spDists(t(as.matrix(KNN$x[x, ])), t(as.matrix(KNN$x[KNN$nn[x, ], ])), longlat = T)) #`as.matrix` will give one column and the function needs two so the use of `t` is needed
+DNN <- dnearneigh(as.matrix(balt[, 1:2]), d1 = min(DIST), d2 = max(DIST), longlat = T)
+#plot(DNN, as.matrix(balt[, 1:2]))
+NBL <- nb2listw(DNN)
+ELM <- errorsarlm(GLM$formula, data = balt, listw = NBL)
+summary(ELM)
+balt[names(ELM$residuals), "residuals"] <- ELM$residuals
+balt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+#DIFF <- SRA - predict(VARS, ELM, ext = EXT)
+#DIFF %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+```
+
+Hmmm, not sure if there is a huge difference here.
+
+## Boosted regression trees
+Use the random fold selection for cross validation (spatially independent blocks runs into problems later in analyzing each order separately - probably sample size - and it returns better values - not as affected by spatial autocorrelation?) 
+```{r, fig.width = 12, fig.height = 10}
+#source("~/Desktop/BIOD/get.blocks.R")
+#BLOCK <- get.blocksR(DATA)
+#DATA %<>% mutate(block = BLOCK)
+#DATA %<>% mutate(block = kfold(DATA, k = 4))
+TRAIN <- DATA %>% filter(block != 1) %>% na.omit
+#TEST <- DATA %>% filter(block == 1) %>% na.omit
+LR <- c(0.1, 0.05, 0.01, 0.005, 0.001)
+TC <- c(1, 2, 3, 5, 7, 10)
+source("~/Desktop/BIOD/BoostedRegressionTreesFunction.R")
+DATA %>% ggplot(aes(x = x, y = y, fill = block)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+#BLEX <- DATA %>% filter(block == 1) %>% extent
+```
+```{r, eval = F}
+DEVI <- foreach(j = 1:4, .packages = c("dismo", "gbm", "doParallel", "tidyverse")) %dopar% {
+  TRAIN <- DATA %>% filter(block != j) %>% na.omit
+  TEST <- DATA %>% filter(block == j) %>% na.omit
+  brt.determine(TRAIN, TEST, 4:19, 3, LR, TC)
+  }
+#DEVI <- brt.determine(TRAIN, TEST, 4:19, 3, LR, TC)
+```
+
+Tree complexity is best set at 7 or 5 to minimize deviance. Both are chosen twice. A learning rate of 0.05 is chosen three times with a learning rate of 0.1 chosen once.
+
+Looking at the differences in predicted SR across CA, the BRT does pretty well! Adding elevation variables fixed the problems with overrepresenting the coasts and underepresenting the highlands. There are a few islands and some areas of Panama that don't work with the model, but I assume they may have low SR but similar environmental values as the cells around them. These predicted outliers could be due to biogeographic or historical reasons (e.g., islands or filter barriers).
+```{r, fig.width=12, fig.height =10}
+set.seed(3)
+DIFF <- foreach(i = 1:4, .packages = c("dismo", "gbm", "tidyverse", "raster"), .combine = "rbind") %do% {
+  TRAIN <- DATA %>% filter(block != i) %>% na.omit
+  TEST <- DATA %>% filter(block == i) %>% na.omit
+  #BLEX <- DATA %>% filter(block == i) %>% extent
+  BRT <- gbm.step(data = TRAIN, gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = 7, learning.rate = 0.05, bag.fraction = 0.5, verbose = F, plot.main = F )
+  DIFF <- TEST %>% select(x, y, sr) %>% mutate(diff = sr - predict(BRT, TEST, n.trees = BRT$gbm.call$best.trees))  
+  DIFF
+}
+#DIFF <- do.call(merge, DIFF) 
+DIFF %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+```
+
+Create a model using the full dataset, look at the spatial patterns of the residuals, and assess the contributions of each variable. The residuals vary less than the GLM and the SRM. It seems that the most important variables are bio4 (temperature seasonality), distance to water, elevation and TRI.
+
+```{r, fig.width = 14, fig.height = 10}
+BRT <- gbm.step(data = na.omit(DATA), gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = 7, learning.rate = 0.05, bag.fraction = 0.5, verbose = F, plot.main = F)
+BRT$contributions
+BRT$contributions %>% ggplot(aes(x = var, y = rel.inf)) + geom_histogram(stat = "identity") 
+boxplot(BRT$residuals)
+DATA %>% na.omit %>% mutate(residuals = BRT$residuals) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+
+Note that the residuals don't seem to show any obvious spatial pattern as seen in the GLMs and SARs. 
+
+# Species richness - separate orders {.tabset}
+## Pearson correlation
+Look at the species richness for each order separately. What we see are pretty different patterns (highest correlation is ~ 0.8) and that bats are driving most of the SR patterns in the region. Rodentia and other groups show more distinct elevational patterns (so we'd expect elevation to be important for rodents).
+
+```{r, fig.width = 18, fig.height = 24}
+ORD <- lapply(levels(RANGE$order_name), function(x) RANGE %>% filter(order_name == x) %$% binomial %>% as.character %>% unique)
+names(ORD) <- levels(RANGE$order_name)
+ORD <- compact(ORD)
+colnames(SAMP) <- sapply(strsplit(colnames(SAMP), "_"), paste, collapse = " ")
+ORDS <- lapply(ORD, function(x) rowSums(SAMP[, colnames(SAMP) %in% x]))
+NANUM <- which(is.na(SRA[]))
+ORDR <- foreach(i = 1:length(ORDS)) %do% {
+  ordr <- SRA
+  ordr[] <- ORDS[[i]]
+  ordr[NANUM] <- NA
+  ordr
+}
+ORDP <- lapply(ORDR, function(x) x %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_viridis() + coord_fixed()) 
+plot_grid(plotlist = ORDP, nrow = 4, labels = names(ORD))
+```
+
+Check for correlation among the orders. Most highly correlated groups are highly correlated with Pilosa.
+```{r}
+layerStats(stack(ORDR), "pearson", na.rm = T)
+```
+
+## GLMs
+Run `glmulti` for each separate group to find the best model for each (again overfitting may be a problem, so we may have to constrain it somehow). Check out the AICc weight table to see which of the retained models are best.
+```{r, message = F, fig.width = 18, fig.height=30, warning= F}
+ORDV <- lapply(1:length(ORDR), function(x) cbind.data.frame(coordinates(ORDR[[x]]), sr = getValues(ORDR[[x]]), getValues(VARS)))
+DENS <- lapply(ORDV, function(i) i %>% ggplot(aes(sr)) + geom_density())
+plot_grid(plotlist = DENS, nrow = 4, labels = names(ORD))
+ORDV <- lapply(1:length(ORDV), function(x) ORDV[[x]][-NANUM, ])
+GLM <- foreach(i = 1:length(ORDV), .packages = "glmulti") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[1]])
+  glmulti(sr ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = ORDV[[i]], level = 1, crit = "aicc", confsetsize = 5, method = "h", plotty = F, report = F)
+}
+lapply(GLM, weightable)
+```
+
+Run the models determined by `glmulti` and plot the residuals to check out the spatial patterns within them.
+```{r, fig.width = 20, fig.height = 10, warning = F}
+PLTV <- foreach(i = 1:length(GLM), .packages = c("tidyverse"), .combine = "rbind") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA, name = names(ORD)[i])
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  #calt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+  calt
+}
+PLTV %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8) + scale_y_continuous(breaks = seq(-60, 35, 10))
+```
+```{r,fig.width = 18, fig.height = 24}
+PLTV <- lapply(names(ORD), function(j) PLTV %>% filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = PLTV, nrow = 4, labels = names(ORD))
+```
+
+## Spatial regression models
+Most groups have spatial autocorrelation at short distances (not unexpected given the data we are working with).
+
+```{r, fig.width = 18, fig.height = 24, warning = F}
+CORL <- foreach(i = 1:length(GLM), .packages = c("tidyverse", "ncf")) %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA)
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  correlog(x = calt$x, y = calt$y, z = calt$residuals, increment = 10, resamp = 100, latlon = T, na.rm = T)
+}
+par(mfrow = c(4, 3))
+for(i in 1:12) {
+  plot(CORL[[i]])
+}
+par(mfrow = c(1, 1))
+#sapply(CORL, plot)
+```
+
+Create SARs for each order given the best model determined by `glmulti`. Also, give the summary of each SAR to see which variables are significant for each order. 
+```{r, fig.width = 18, fig.height = 10, warning = F}
+ELMO <- foreach(i = 1:length(GLM), .packages = c("tidyverse", "ncf", "spdep")) %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA)
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  errorsarlm(GLM[[i]]@objects[[1]]$formula, data = calt, listw = NBL)
+}
+lapply(ELMO, summary)
+
+ELPL <- foreach(i = 1:length(ELMO), .packages = c("tidyverse", "viridis", "spdep"), .combine = "rbind") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA, name = names(ORD)[i])
+  calt[names(ELMO[[i]]$residuals), "residuals"] <- ELMO[[i]]$residuals
+  #calt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+  calt
+}
+ELPL %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8) + scale_y_continuous(breaks = seq(-65, 30, 10))
+```
+```{r, fig.width = 18, fig.height = 24}
+ELPL <- lapply(names(ORD), function(j) ELPL %>% dplyr::filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = ELPL, nrow = 4, labels = names(ORD))
+```
+Residuals still show some fairly obvious spatial patterns, so that's interesting (in a bad way, probably - may have to fiddle with the neighborhood criteria)
+
+```{r, fig.width = 18, fig.height = 24, warning = F}
+DIFFO <- foreach(i = 1:length(ELMO), .packages = c("tidyverse", "viridis", "raster")) %do% {
+  diff <- ORDR[[i]] - predict(VARS, ELMO[[i]], ext = EXT)
+  diff %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+}
+plot_grid(plotlist = DIFFO, nrow = 4, labels = names(ORD))
+```
+
+Chiroptera refuses to be predicted along with most of the other groups (especially Cingulata and Rodentia)
+
+## Boosted regression trees
+Train the models using random fold cross validation and determine the appropriate parameters.
+```{r}
+cl <- makeCluster(7, "SOCK")
+registerDoSNOW(cl)
+```
+```{r, eval = F}
+balt <- foreach(i = 1:12, .packages = c("tidyverse", "magrittr", "dismo", "gbm", "doParallel"), .errorhandling = "remove") %dopar% {
+  source("~/Desktop/BIOD/brt.determine.R")
+  set.seed(1836)
+  ORDV[[i]] <- rbind(ORDV[[i]] %>% filter(sr == 0) %>% mutate(fold = kfold(., 4)), ORDV[[i]] %>% filter(sr != 0) %>% mutate(fold = kfold(., 4)))
+  alt <- foreach(j = 1:4, .packages = c("dismo", "gbm", "doParallel"), .errorhandling = "pass") %dopar% {
+  TRAIN <- ORDV[[i]] %>% filter(fold != 1) %>% na.omit
+  TEST <- ORDV[[i]] %>% filter(fold == 1) %>% na.omit
+  brt.determineR(TRAIN, TEST, 4:19, 3, LR, TC)
+  }
+  list(names(ORD)[i], alt)
+}
+```
+Mostly fixed issues with BRTs, likely an issue of sample size caused by spatial stratification. 
+
+```{r}
+#ORDB <- ORDV[c(1:7, 10:12)] #find those orders that worked for parameterization
+#OSRA <- ORDR[c(1:7, 10:12)] #grab the species richness for these orders #which(names(ORD) %in% sapply(dalt, "[[", 1))
+PARS <- cbind.data.frame(TC = c(10, 10, 7, 5, 10, 10, 10, 7, 10, 10, 10, 10), LR = c(0.005, 0.005, 0.05, 0.05, 0.01, 0.05, 0.01, 0.005, 0.01, 0.05, 0.05, 0.05))
+```
+Test the quality of the predictions of each model (and its parameters) and get predictions for each subset.
+```{r, eval = F}
+ODIF <- foreach(j = 1:length(ORDV), .packages = c("dismo", "gbm", "tidyverse", "raster", "viridis", "foreach", "magrittr", "doParallel"), .errorhandling = "remove") %dopar% {
+  set.seed(1836)
+  ORDV[[j]] <- rbind(ORDV[[j]] %>% filter(sr == 0) %>% mutate(fold = kfold(., 4)), ORDV[[j]] %>% filter(sr > 0) %>% mutate(fold = kfold(., 4)))
+  ODIF <- foreach(i = 1:4, .packages = c("dismo", "gbm", "tidyverse", "raster"), .combine = "rbind", .errorhandling = "pass") %dopar% {
+  TRAIN <- ORDV[[j]] %>% filter(fold != i) %>% na.omit
+  TEST <- ORDV[[j]] %>% filter(fold == i) %>% na.omit
+  BRT <- gbm.step(data = TRAIN, gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = PARS[j, 1], learning.rate = PARS[j, 2], bag.fraction = 0.5, verbose = F, plot.main = F)
+  DIFF <- TEST %>% dplyr::select(x, y, sr) %>% mutate(diff = sr - predict(BRT, TEST, n.trees = BRT$gbm.call$best.trees))  
+  DIFF
+  }
+  ODIF
+}
+```
+```{r, fig.width = 18, fig.height = 10}
+ODIF <- read.csv("~/Desktop/BIOD/order_diff_sr.csv", header = T)
+ODIF %>% ggplot(aes(x = name, y = diff, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8) + scale_y_continuous(breaks = seq(-50, 30, 10))
+```
+```{r, fig.width = 18, fig.height = 24}
+DIFP <- foreach(i = 1:12, .packages = c("raster", "tidyverse")) %do% {
+  ODIF %>% filter(name == names(ORD)[i]) %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+}
+plot_grid(plotlist = DIFP, nrow = 4, labels = names(ORD))
+```
+
+Differences in prediction are A LOT better! Chiroptera is mainly restricted to with +/- 10 with the obvious exception being our good island/peninsula friends in Panama. Same with everything else (in particular, Rodentia is impressive considering the number of species - topography likely super important).
+
+Find the variable contribution to each order, lots of orders driving BIO4's importance. Elevation super important for rodents. Lagomorphs like CEC and NPP. Didelphimorphs like stable forest cover.
+```{r, fig.width = 18, fig.height = 10}
+OBRT <- foreach(j = 1:length(ORDV), .packages = c("dismo", "gbm", "tidyverse", "raster", "viridis", "foreach", "magrittr", "doParallel")) %dopar% {
+  brt <- gbm.step(data = na.omit(ORDV[[j]]), gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = PARS[j, 1], learning.rate = PARS[j, 2], bag.fraction = 0.5, verbose = F, plot.main = F)
+}
+CONTS <- cbind.data.frame(do.call(rbind, lapply(1:length(OBRT), function(x) OBRT[[x]]$contributions)), name = rep(names(ORD), each = 16))
+ggplot(CONTS, aes(x = var, y = rel.inf, fill = name)) + geom_histogram(stat = "identity", position = "dodge2") + scale_y_continuous(expand = c(0,0))
+CONTS %>% ggplot(aes(x = var, y = name, fill = rel.inf)) + geom_tile() + scale_fill_viridis_c()
+RESOR <- foreach(j = 1:length(ORDV), .packages = c("tidyverse", "viridis"), .combine = "rbind") %do% {
+  ORDV[[j]] %>% na.omit %>% mutate(residuals = OBRT[[j]]$residuals, name = names(ORD)[j])
+}
+RESOR %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8)
+```
+
+```{r, fig.width = 18, fig.height = 24}
+RESO <- lapply(names(ORD), function(j) RESOR %>% filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = RESO, nrow = 4, labels = names(ORD))
+```
+
+Residuals don't vary much and show no extreme spatial patterns :0
+
+# Phylogenetic Diversity - all mammals {.tabset}
+## GLM
+```{r}
+DATA <- cbind.data.frame(coordinates(VARS), pd = getValues(PD$PD_raster), getValues(VARS))
+DATA <- DATA[-which(is.na(DATA$pd)), ]
+DATA %>% ggplot(aes(pd)) + geom_density()
+DATA$pd <- log(DATA$pd)
+DATA %>% ggplot(aes(pd)) + geom_density()
+```
+
+Data are right skewed. Not unexpected given what we saw from SR. But we have to log transform PD (similar to **Rosauer et al 2016 Phylogeography, hotspots, and conservation priorities: An example from the Top End of Australia**, I think) because nothing will play well with a 1,000 unit gap between pixels, it seems. Preliminary tests show that everything is a bit more managed, so hopefully the GLMs and SARs will work better as well. 
+
+```{r, results = "hide", message = F}
+rownames(DATA) <- 1:nrow(DATA)
+set.seed(3)
+DATA %<>% mutate(fold = kfold(DATA, k = 5))
+TEST <- DATA %>% filter(fold == 5)
+```
+
+```{r, eval = F}
+OUT <- foreach(i = 1:4, .packages = c("tidyverse", "glmulti", "Metrics"), .export = "DATA") %do% {
+TRAIN <- DATA %>% dplyr::filter(fold != i & fold != 5)
+VALID <- DATA %>% dplyr::filter(fold == i)
+lmout <- glmulti::glmulti(pd ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = TRAIN, level = 1, crit = "aicc", confsetsize = 5, method = "h", plotty = F, report = F)
+pred <- lapply(1:length(lmout@objects), function(x) predict(lmout@objects[[x]], VALID))
+RME <- sapply(pred, function(x) rmse(VALID$pd[-which(is.na(x))], x[-which(is.na(x))]))
+cbind(weightable(lmout), RME)
+}
+OUT
+unique(sapply(OUT, "[[", 1)[1, ])
+```
+
+```{r, fig.width = 12, fig.height = 10}
+TST <- predict(glm(pd ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = DATA %>% filter(fold != 5)), TEST) 
+RME <- rmse(TEST$pd[-which(is.na(TST))], TST[-which(is.na(TST))])
+RME
+set.seed(1836)
+DATA %<>% mutate(block = kfold(DATA, k = 4))
+DIFG <- foreach(i = 1:4, .combine = "rbind") %do% {
+  TRAIN <- DATA %>% filter(block != i)
+  TEST <- DATA %>% filter(block == i)
+  GLM <- glm(pd ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = TRAIN)
+  pred <- predict(GLM, TEST)
+  TEST %>% select(x, y, pd) %>% mutate(diff = pd - pred)
+}
+DIFG %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+GLM <- glm(pd ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = DATA)
+summary(GLM)
+RESID <- DATA %>% mutate(residuals = NA)
+RESID[names(GLM$residuals), "residuals"] <- GLM$residuals
+RESID %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+
+Same as with SR, there are two small areas (same ones, it appears) that it can't predict and GLM prediction along the coasts is underpredicting and overpredicting on the interior (not due to elevation at least because Panamanian lowlands and Nicaraguan depression are being overpredicted too). Obvious spatial autocorrelation seen in the residuals (but less obvious than before the log transformation).
+
+## Spatial Regression Models (`package::spdep`)
+
+```{r, fig.width = 12, fig.height = 10, warning=F}
+COR <- correlog(x = RESID$x, y = RESID$y, z = RESID$residuals, increment = 10, resamp = 100, latlon = T, na.rm = T)
+plot(COR)
+KNN <- knearneigh(as.matrix(RESID[, 1:2]), longlat = T)
+DIST <- sapply(1:length(KNN$nn), function(x) spDists(t(as.matrix(KNN$x[x, ])), t(as.matrix(KNN$x[KNN$nn[x, ], ])), longlat = T)) #`as.matrix` will give one column and the function needs two so the use of `t` is needed
+DNN <- dnearneigh(as.matrix(RESID[, 1:2]), d1 = min(DIST), d2 = max(DIST), longlat = T)
+NBL <- nb2listw(DNN, zero.policy = T)
+plot(DNN, as.matrix(RESID[, 1:2]))
+ELM <- errorsarlm(GLM$formula, data = RESID, listw = NBL, zero.policy = T)
+summary(ELM)
+RESID[names(ELM$residuals), "residuals"] <- ELM$residuals
+RESID %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+#DIFF <- SRA - predict(VARS, ELM, ext = EXT)
+#DIFF %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+```
+
+Hmmm, spatial pattern of the residuals is dealt with it seems, which is promising.
+
+## Boosted Regression Trees
+```{r, fig.width = 12, fig.height = 10}
+LR <- c(0.1, 0.05, 0.01, 0.005, 0.001)
+TC <- c(1, 2, 3, 5, 7, 10)
+source("~/Desktop/BIOD/brt.determine.R")
+DATA %>% ggplot(aes(x = x, y = y, fill = block)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+```{r, eval = F}
+cl <- makeCluster(4, "SOCK")
+registerDoSNOW(cl)
+DEVI <- foreach(j = 1:4, .packages = c("dismo", "gbm", "doParallel", "tidyverse"), .errorhandling = "pass") %dopar% {
+  TRAIN <- DATA %>% filter(block != j) %>% na.omit
+  TEST <- DATA %>% filter(block == j) %>% na.omit
+  BRT <- brt.determineR(TRAIN, TEST, 4:19, 3, LR, TC)
+  write.csv(BRT, paste("~/Desktop/BIOD/parameter_brt_", j, ".csv", sep = ""))
+  BRT
+}
+sapply(DEVI, function(x) which.min(x$devi))
+```
+TC of 10 and a learning rate of 0.1 it is.
+
+```{r, fig.width=12, fig.height =10}
+DIFF <- foreach(i = 1:4, .packages = c("dismo", "gbm", "tidyverse", "raster"), .combine = "rbind") %do% {
+  TRAIN <- na.omit(filter(DATA, block != i))
+  TEST <- na.omit(filter(DATA, block == i))
+  #BLEX <- DATA %>% filter(block == i) %>% extent
+  BRT <- gbm.step(data = TRAIN, gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = 10, learning.rate = 0.005, bag.fraction = 0.5, verbose = F, plot.main = F )
+  DIFF <- TEST %>% select(x, y, pd) %>% mutate(diff = pd - predict(BRT, TEST, n.trees = BRT$gbm.call$best.trees))  
+  DIFF
+}
+#DIFF <- do.call(merge, DIFF) 
+DIFF %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+```
+
+```{r, fig.width = 14, fig.height = 10}
+BRT <- gbm.step(data = na.omit(DATA), gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = 10, learning.rate = 0.005, bag.fraction = 0.5, verbose = F, plot.main = F)
+BRT$contributions
+BRT$contributions %>% ggplot(aes(x = var, y = rel.inf)) + geom_histogram(stat = "identity") 
+boxplot(BRT$residuals)
+DATA %>% na.omit %>% mutate(residuals = BRT$residuals) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+
+
+# Phylogenetic Diversity - separate orders {.tabset}
+## Pearson correlation
+```{r}
+colnames(SAMP) <- gsub(" ", "_", colnames(SAMP)) #changes species names in the community matrix to match with the tree tip names
+ORD <- lapply(levels(RANGE$order_name), function(x) RANGE %>% filter(order_name == x) %$% binomial %>% as.character %>% unique)
+names(ORD) <- levels(RANGE$order_name)
+ORD <- compact(ORD)
+ORD <- lapply(ORD, function(i) gsub(" ", "_", i))
+#colnames(SAMP) <- sapply(strsplit(colnames(SAMP), "_"), paste, collapse = " ")
+```
+```{r, results = "hide"}
+ORDS <- lapply(ORD, function(j) phylogenetic.endemism(data.frame(SAMP[, colnames(SAMP) %in% j]), records = "site", site.coords = coordinates(RAST), longitude = "x", latitude = "y", sep.comm.spp = "_", phylo.tree = TREE$mammalST_MSW05_bestDates, sep.phylo.spp = "_", frame.raster = RAST, pe.type = "unweighted", plot.raster = F))
+for(i in 1:12) {
+  calt <- ORDS[[i]]$PD_raster
+  calt[setdiff(which(!is.na(PD$PD_raster[])), which(!is.na(calt[])))] <- 0 
+  ORDS[[i]]$PD_raster <- calt
+}
+```
+```{r, fig.width=24, fig.height=18}
+ORDP <- lapply(ORDS, function(x) x %$% PD_raster %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = log(layer))) + geom_raster() + scale_fill_viridis() + coord_fixed()) 
+plot_grid(plotlist = ORDP, nrow = 4, labels = names(ORD))
+```
+
+```{r}
+layerStats(stack(lapply(ORDS, function(x) x %$% PD_raster)), "pearson", na.rm = T)
+```
+
+Pilosa and Cingulata are the only things correlated > 0.7
+
+## GLMs
+Run `glmulti` for each separate group to find the best model for each (again overfitting may be a problem, so we may have to constrain it somehow). Check out the AICc weight table to see which of the retained models are best.
+```{r, message = F, fig.width = 18, fig.height=30}
+NANUM <- which(is.na(PD$PD_raster[]))
+ORDV <- lapply(1:length(ORDS), function(x) cbind.data.frame(coordinates(ORDS[[x]]$PD_raster), pd = log(getValues(ORDS[[x]]$PD_raster)), getValues(VARS)))
+#ORDV[c(3, 12)] <- lapply(c(3, 12), function(x) ORDV[[x]] %>% mutate(pd = log(.$pd)))
+#ORDV[[3]]$pd[which(is.infinite(ORDV[[3]]$pd))] <- 0
+#ORDV[[12]]$pd[which(is.infinite(ORDV[[12]]$pd))] <- 0
+ORDV <- foreach(i = 1:12) %do% {
+  ORDV[[i]]$pd[which(is.infinite(ORDV[[i]]$pd))] <- 0
+  ORDV[[i]]
+}
+DENS <- lapply(ORDV, function(i) i %>% ggplot(aes(pd)) + geom_density())
+plot_grid(plotlist = DENS, nrow = 4)
+ORDV <- lapply(1:length(ORDV), function(x) ORDV[[x]][-NANUM, ])
+GLM <- foreach(i = 1:length(ORDV), .packages = "glmulti") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[1]])
+  glmulti(pd ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = ORDV[[i]], level = 1, crit = "aicc", confsetsize = 5, method = "h", plotty = F, report = F)
+}
+lapply(GLM, weightable)
+```
+
+Run the models determined by `glmulti` and plot the residuals to check out the spatial patterns within them.
+```{r, fig.width = 18, fig.height = 10, warning = F}
+PLTV <- foreach(i = 1:length(GLM), .packages = c("tidyverse"), .combine = "rbind") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA, name = names(ORD)[i])
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  #calt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+  calt
+}
+PLTV %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8)
+```
+```{r, fig.width = 24, fig.height = 18}
+PLTV <- lapply(names(ORD), function(j) PLTV %>% filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = PLTV, nrow = 4, labels = names(ORD))
+```
+
+Whew, look at those residual patterns, ugh. 
+
+## Spatial regression models
+Most groups again have spatial autocorrelation at short distances (unlike what we see with PE of all mammals).
+
+```{r, fig.width = 18, fig.height = 24, warning = F}
+CORL <- foreach(i = 1:length(GLM), .packages = c("tidyverse", "ncf")) %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA)
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  correlog(x = calt$x, y = calt$y, z = calt$residuals, increment = 10, resamp = 100, latlon = T, na.rm = T)
+}
+par(mfrow = c(4, 3))
+for(i in 1:12) {
+  plot(CORL[[i]])
+}
+par(mfrow = c(1, 1))
+#sapply(CORL, plot)
+```
+
+Create SARs for each order given the best model determined by `glmulti`. Also, give the summary of each SAR to see which variables are significant for each order. 
+```{r, fig.width = 18, fig.height = 10, warning = F}
+ELMO <- foreach(i = 1:length(GLM), .packages = c("tidyverse", "ncf", "spdep")) %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA)
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  KNN <- knearneigh(as.matrix(calt[, 1:2]), longlat = T)
+  DIST <- sapply(1:length(KNN$nn), function(x) spDists(t(as.matrix(KNN$x[x, ])), t(as.matrix(KNN$x[KNN$nn[x, ], ])), longlat = T))
+  DNN <- dnearneigh(as.matrix(calt[, 1:2]), d1 = min(DIST), d2 = max(DIST), longlat = T)
+  NBL <- nb2listw(DNN, zero.policy = T)
+  errorsarlm(GLM[[i]]@objects[[1]]$formula, data = calt, listw = NBL, zero.policy = T)
+}
+lapply(ELMO, summary)
+
+ELPL <- foreach(i = 1:length(ELMO), .packages = c("tidyverse", "viridis", "spdep"), .combine = "rbind") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA, name = names(ORD)[i])
+  calt[names(ELMO[[i]]$residuals), "residuals"] <- ELMO[[i]]$residuals
+  #calt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+  calt
+}
+ELPL %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8) + scale_y_continuous()
+```
+
+```{r, fig.width = 18, fig.height = 24}
+ELPL <- lapply(names(ORD), function(j) ELPL %>% dplyr::filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = ELPL, nrow = 4, labels = names(ORD))
+```
+
+```{r, fig.width = 18, fig.height = 24, warning = F}
+DIFFO <- foreach(i = 1:length(ELMO), .packages = c("tidyverse", "viridis", "raster")) %do% {
+  diff <- ORDR[[i]] - predict(VARS, ELMO[[i]], ext = EXT)
+  diff %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+}
+plot_grid(plotlist = DIFFO, nrow = 4, labels = names(ORD))
+```
+
+## Boosted regression trees
+Train the models using random fold cross validation and determine the appropriate parameters.
+```{r}
+cl <- makeCluster(7, "SOCK")
+registerDoSNOW(cl)
+```
+```{r, eval = F}
+alt <- foreach(i = 1:12, .packages = c("tidyverse", "magrittr", "dismo", "gbm", "doParallel"), .errorhandling = "remove") %dopar% {
+  source("~/Desktop/BIOD/brt.determine.R")
+  set.seed(1836)
+  ORDV[[i]] <- rbind(ORDV[[i]] %>% filter(pd == 0) %>% mutate(fold = kfold(., 4)), ORDV[[i]] %>% filter(pd != 0) %>% mutate(fold = kfold(., 4)))
+  alt <- foreach(j = 1:4, .packages = c("dismo", "gbm", "doParallel"), .errorhandling = "pass") %dopar% {
+  TRAIN <- ORDV[[i]] %>% filter(fold != j) %>% na.omit
+  TEST <- ORDV[[i]] %>% filter(fold == j) %>% na.omit
+  brt.determineR(TRAIN, TEST, 4:19, 3, LR, TC)
+  }
+  list(names(ORD)[i], alt)
+}
+```
+
+Redid the `brt.determine` function to fix some of the issues that I have been having. Briefly, I changed it to catch a failed run result of null and added multiple `if` statements to fill in the blanks when that happened. Also, now the result of `brt.determine` is a data.frame.
+
+```{r}
+PARS <- cbind.data.frame(TC = c(3, 5, 10, 10, 5, 10, 10, 10, 10, 7, 10, 10), LR = c(0.001, 0.001, 0.001, 0.005, 0.01, 0.01, 0.01, 0.001, 0.01, 0.05, 0.01, 0.005))
+```
+Test the quality of the predictions of each model (and its parameters) and get predictions for each subset.
+```{r, eval = F}
+ODIF <- foreach(j = 1:length(ORDV), .packages = c("dismo", "gbm", "tidyverse", "raster", "viridis", "foreach", "magrittr", "doParallel"), .errorhandling = "remove", .combine = "rbind") %dopar% {
+  set.seed(1836)
+  ORDV[[j]] <- rbind(ORDV[[i]] %>% filter(pd == 0) %>% mutate(fold = kfold(., 4)), ORDV[[i]] %>% filter(pd != 0) %>% mutate(fold = kfold(., 4)))
+  ODIF <- foreach(i = 1:4, .packages = c("dismo", "gbm", "tidyverse", "raster"), .combine = "rbind", .errorhandling = "pass") %dopar% {
+  TRAIN <- ORDV[[j]] %>% filter(fold != i) %>% na.omit
+  TEST <- ORDV[[j]] %>% filter(fold == i) %>% na.omit
+  set.seed(1876)
+  BRT <- gbm.step(data = TRAIN, gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = PARS[j, 1], learning.rate = PARS[j, 2], bag.fraction = 0.5, verbose = F, plot.main = F)
+  DIFF <- TEST %>% dplyr::select(x, y, pd) %>% mutate(diff = pd - predict(BRT, TEST, n.trees = BRT$gbm.call$best.trees), name = names(ORD)[j])  
+  DIFF
+  }
+  ODIF
+}
+```
+```{r, fig.width = 18, fig.height = 10}
+ODIF <- read.csv("~/Desktop/BIOD/order_diff_pd.csv", header = T)
+ODIF %>% ggplot(aes(x = name, y = diff, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8)
+```
+```{r, fig.width = 18, fig.height = 24}
+DIFP <- foreach(i = 1:12, .packages = c("raster", "tidyverse")) %do% {
+  ODIF %>% filter(name == names(ORD)[i]) %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+}
+plot_grid(plotlist = DIFP, nrow = 4, labels = names(ORD))
+```
+
+
+Find the variable contribution to each order, lots of orders driving BIO4's importance. Elevation super important for rodents. Lagomorphs like CEC and NPP. Didelphimorphs like stable forest cover.
+```{r, fig.width = 18, fig.height = 10}
+OBRT <- foreach(j = 1:length(ORDV), .packages = c("dismo", "gbm", "tidyverse", "raster", "viridis", "foreach", "magrittr", "doParallel")) %dopar% {
+  brt <- gbm.step(data = na.omit(ORDV[[j]]), gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = PARS[j, 1], learning.rate = PARS[j, 2], bag.fraction = 0.5, verbose = F, plot.main = F)
+}
+CONTD <- cbind.data.frame(do.call(rbind, lapply(1:length(OBRT), function(x) OBRT[[x]]$contributions)), name = rep(names(ORD), each = 16))
+ggplot(CONTD, aes(x = var, y = rel.inf, fill = name)) + geom_histogram(stat = "identity", position = "dodge2") + scale_y_continuous(expand = c(0,0))
+CONTD %>% ggplot(aes(x = var, y = name, fill = rel.inf)) + geom_tile() + scale_fill_viridis_c()
+RESOR <- foreach(j = 1:length(ORDV), .packages = c("tidyverse", "viridis"), .combine = "rbind") %do% {
+  ORDV[[j]] %>% na.omit %>% mutate(residuals = OBRT[[j]]$residuals, name = names(ORD)[j])
+}
+RESOR %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8)
+```
+
+```{r, fig.width = 18, fig.height = 24}
+RESO <- lapply(names(ORD), function(j) RESOR %>% filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = RESO, nrow = 4, labels = names(ORD))
+```
+
+# Weighted endemism - all mammals {.tabset}
+## GLM
+```{r}
+DATA <- cbind.data.frame(coordinates(VARS), we = getValues(WE$WE_raster), getValues(VARS))
+DATA <- DATA[-which(is.na(DATA$we)), ]
+DATA %>% ggplot(aes(we)) + geom_density()
+```
+Oooh, something that is left skewed now!
+
+```{r, results = "hide", message = F}
+rownames(DATA) <- 1:nrow(DATA)
+set.seed(3)
+DATA %<>% mutate(fold = kfold(DATA, k = 5))
+TEST <- DATA %>% filter(fold == 5)
+```
+
+```{r, eval = F}
+OUT <- foreach(i = 1:4, .packages = c("tidyverse", "glmulti", "Metrics"), .export = "DATA") %do% {
+TRAIN <- DATA %>% dplyr::filter(fold != i & fold != 5)
+VALID <- DATA %>% dplyr::filter(fold == i)
+lmout <- glmulti::glmulti(we ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = TRAIN, level = 1, crit = "aicc", confsetsize = 5, method = "h", plotty = F, report = F)
+pred <- lapply(1:length(lmout@objects), function(x) predict(lmout@objects[[x]], VALID))
+RME <- sapply(pred, function(x) rmse(VALID$we[-which(is.na(x))], x[-which(is.na(x))]))
+cbind(weightable(lmout), RME)
+}
+OUT
+unique(sapply(OUT, "[[", 1)[1, ])
+```
+
+```{r, fig.width = 12, fig.height = 10}
+TST <- predict(glm(we ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = DATA %>% filter(fold != 5)), TEST) 
+RME <- rmse(TEST$we[-which(is.na(TST))], TST[-which(is.na(TST))])
+RME
+set.seed(1836)
+DATA %<>% mutate(block = kfold(DATA, k = 4))
+DIFG <- foreach(i = 1:4, .combine = "rbind") %do% {
+  TRAIN <- DATA %>% filter(block != i)
+  TEST <- DATA %>% filter(block == i)
+  GLM <- glm(we ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = TRAIN)
+  pred <- predict(GLM, TEST)
+  TEST %>% select(x, y, we) %>% mutate(diff = we - pred)
+}
+DIFG %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+GLM <- glm(we ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = DATA)
+summary(GLM)
+RESID <- DATA %>% mutate(residuals = NA)
+RESID[names(GLM$residuals), "residuals"] <- GLM$residuals
+RESID %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+
+## Spatial Regression Models (`package::spdep`)
+
+```{r, fig.width = 12, fig.height = 10, warning=F}
+COR <- correlog(x = RESID$x, y = RESID$y, z = RESID$residuals, increment = 10, resamp = 100, latlon = T, na.rm = T)
+plot(COR)
+KNN <- knearneigh(as.matrix(RESID[, 1:2]), longlat = T)
+DIST <- sapply(1:length(KNN$nn), function(x) spDists(t(as.matrix(KNN$x[x, ])), t(as.matrix(KNN$x[KNN$nn[x, ], ])), longlat = T)) #`as.matrix` will give one column and the function needs two so the use of `t` is needed
+DNN <- dnearneigh(as.matrix(RESID[, 1:2]), d1 = min(DIST), d2 = max(DIST), longlat = T)
+NBL <- nb2listw(DNN, zero.policy = T)
+plot(DNN, as.matrix(RESID[, 1:2]))
+ELM <- errorsarlm(GLM$formula, data = RESID, listw = NBL, zero.policy = T)
+summary(ELM)
+RESID[names(ELM$residuals), "residuals"] <- ELM$residuals
+RESID %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+#DIFF <- SRA - predict(VARS, ELM, ext = EXT)
+#DIFF %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+```
+
+## Boosted Regression Trees
+```{r, fig.width = 12, fig.height = 10}
+LR <- c(0.1, 0.05, 0.01, 0.005, 0.001)
+TC <- c(1, 2, 3, 5, 7, 10)
+source("~/Desktop/BIOD/brt.determine.R")
+DATA %>% ggplot(aes(x = x, y = y, fill = block)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+
+```{r, eval = F}
+cl <- makeCluster(4, "SOCK")
+registerDoSNOW(cl)
+DEVI <- foreach(j = 1:4, .packages = c("dismo", "gbm", "doParallel", "tidyverse"), .errorhandling = "pass") %dopar% {
+  TRAIN <- DATA %>% filter(block != j) %>% na.omit
+  TEST <- DATA %>% filter(block == j) %>% na.omit
+  BRT <- brt.determineR(TRAIN, TEST, 4:19, 3, LR, TC)
+  write.csv(BRT, paste("~/Desktop/BIOD/parameter_brt_", j, ".csv", sep = ""))
+  BRT
+}
+sapply(DEVI, function(x) which.min(x$devi))
+```
+TC of 10 and a learning rate of 0.005 it is.
+
+```{r, fig.width=12, fig.height =10}
+DIFF <- foreach(i = 1:4, .packages = c("dismo", "gbm", "tidyverse", "raster"), .combine = "rbind") %do% {
+  TRAIN <- na.omit(filter(DATA, block != i))
+  TEST <- na.omit(filter(DATA, block == i))
+  #BLEX <- DATA %>% filter(block == i) %>% extent
+  BRT <- gbm.step(data = TRAIN, gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = 10, learning.rate = 0.005, bag.fraction = 0.5, verbose = F, plot.main = F )
+  DIFF <- TEST %>% select(x, y, we) %>% mutate(diff = we - predict(BRT, TEST, n.trees = BRT$gbm.call$best.trees))  
+  DIFF
+}
+#DIFF <- do.call(merge, DIFF) 
+DIFF %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+```
+
+```{r, fig.width = 14, fig.height = 10}
+BRT <- gbm.step(data = na.omit(DATA), gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = 10, learning.rate = 0.005, bag.fraction = 0.5, verbose = F, plot.main = F)
+BRT$contributions
+BRT$contributions %>% ggplot(aes(x = var, y = rel.inf)) + geom_histogram(stat = "identity") 
+boxplot(BRT$residuals)
+DATA %>% na.omit %>% mutate(residuals = BRT$residuals) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+
+# Weighted endemism - separate orders {.tabset}
+## Pearson correlation
+```{r}
+colnames(SAMP) <- gsub(" ", "_", colnames(SAMP)) #changes species names in the community matrix to match with the tree tip names
+ORD <- lapply(levels(RANGE$order_name), function(x) RANGE %>% filter(order_name == x) %$% binomial %>% as.character %>% unique)
+names(ORD) <- levels(RANGE$order_name)
+ORD <- compact(ORD)
+ORD <- lapply(ORD, function(i) gsub(" ", "_", i))
+#colnames(SAMP) <- sapply(strsplit(colnames(SAMP), "_"), paste, collapse = " ")
+```
+```{r, results = "hide"}
+ORDS <- lapply(ORD, function(j) weighted.endemism(data.frame(SAMP[, colnames(SAMP) %in% j]), records = "site", site.coords = coordinates(RAST), longitude = "x", latitude = "y", frame.raster = RAST, species = colnames(SAMP) %in% j, plot.raster = F))
+for(i in 1:12) {
+  calt <- ORDS[[i]]$WE_raster
+  calt[setdiff(which(!is.na(WE$WE_raster[])), which(!is.na(calt[])))] <- 0 
+  ORDS[[i]]$WE_raster <- calt
+}
+```
+
+```{r, fig.width=24, fig.height=18}
+ORDP <- lapply(ORDS, function(x) x %$% WE_raster %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_viridis() + coord_fixed()) 
+plot_grid(plotlist = ORDP, nrow = 4, labels = names(ORD))
+```
+
+```{r}
+layerStats(stack(lapply(ORDS, function(x) x %$% WE_raster)), "pearson", na.rm = T)
+```
+
+## GLMs
+Run `glmulti` for each separate group to find the best model for each (again overfitting may be a problem, so we may have to constrain it somehow). Check out the AICc weight table to see which of the retained models are best.
+```{r, message = F, fig.width = 18, fig.height=30}
+NANUM <- which(is.na(WE$WE_raster[]))
+ORDV <- lapply(1:length(ORDS), function(x) cbind.data.frame(coordinates(ORDS[[x]]$WE_raster), we = getValues(ORDS[[x]]$WE_raster), getValues(VARS)))
+DENS <- lapply(ORDV, function(i) i %>% ggplot(aes(we)) + geom_density())
+plot_grid(plotlist = DENS, nrow = 4)
+ORDV <- lapply(1:length(ORDV), function(x) ORDV[[x]][-NANUM, ])
+GLM <- foreach(i = 1:length(ORDV), .packages = "glmulti") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[1]])
+  glmulti(we ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = ORDV[[i]], level = 1, crit = "aicc", confsetsize = 5, method = "h", plotty = F, report = F)
+}
+lapply(GLM, weightable)
+```
+
+Run the models determined by `glmulti` and plot the residuals to check out the spatial patterns within them.
+```{r, fig.width = 18, fig.height = 10, warning = F}
+PLTV <- foreach(i = 1:length(GLM), .packages = c("tidyverse"), .combine = "rbind") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA, name = names(ORD)[i])
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  #calt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+  calt
+}
+PLTV %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8)
+```
+
+```{r, fig.width = 24, fig.height = 18}
+PLTV <- lapply(names(ORD), function(j) PLTV %>% filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = PLTV, nrow = 4, labels = names(ORD))
+```
+
+## Spatial regression models
+Most groups again have spatial autocorrelation at short distances (unlike what we see with PE of all mammals).
+
+```{r, fig.width = 18, fig.height = 24, warning = F}
+CORL <- foreach(i = 1:length(GLM), .packages = c("tidyverse", "ncf")) %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA)
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  correlog(x = calt$x, y = calt$y, z = calt$residuals, increment = 10, resamp = 100, latlon = T, na.rm = T)
+}
+par(mfrow = c(4, 3))
+for(i in 1:12) {
+  plot(CORL[[i]])
+}
+par(mfrow = c(1, 1))
+#sapply(CORL, plot)
+```
+
+Create SARs for each order given the best model determined by `glmulti`. Also, give the summary of each SAR to see which variables are significant for each order. 
+```{r, fig.width = 18, fig.height = 10, warning = F}
+ELMO <- foreach(i = 1:length(GLM), .packages = c("tidyverse", "ncf", "spdep")) %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA)
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  KNN <- knearneigh(as.matrix(calt[, 1:2]), longlat = T)
+  DIST <- sapply(1:length(KNN$nn), function(x) spDists(t(as.matrix(KNN$x[x, ])), t(as.matrix(KNN$x[KNN$nn[x, ], ])), longlat = T))
+  DNN <- dnearneigh(as.matrix(calt[, 1:2]), d1 = min(DIST), d2 = max(DIST), longlat = T)
+  NBL <- nb2listw(DNN, zero.policy = T)
+  errorsarlm(GLM[[i]]@objects[[1]]$formula, data = calt, listw = NBL, zero.policy = T)
+}
+lapply(ELMO, summary)
+
+ELPL <- foreach(i = 1:length(ELMO), .packages = c("tidyverse", "viridis", "spdep"), .combine = "rbind") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA, name = names(ORD)[i])
+  calt[names(ELMO[[i]]$residuals), "residuals"] <- ELMO[[i]]$residuals
+  #calt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+  calt
+}
+ELPL %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8) + scale_y_continuous()
+```
+
+```{r, fig.width = 18, fig.height = 24}
+ELPL <- lapply(names(ORD), function(j) ELPL %>% dplyr::filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = ELPL, nrow = 4, labels = names(ORD))
+```
+
+```{r, fig.width = 18, fig.height = 24, warning = F}
+DIFFO <- foreach(i = 1:length(ELMO), .packages = c("tidyverse", "viridis", "raster")) %do% {
+  diff <- ORDS[[i]]$WE_raster - predict(VARS, ELMO[[i]], ext = EXT)
+  diff %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+}
+plot_grid(plotlist = DIFFO, nrow = 4, labels = names(ORD))
+```
+
+## Boosted regression trees
+Train the models using random fold cross validation and determine the appropriate parameters.
+```{r}
+cl <- makeCluster(7, "SOCK")
+registerDoSNOW(cl)
+```
+```{r, eval = F}
+balt <- foreach(i = 1:12, .packages = c("tidyverse", "magrittr", "dismo", "gbm", "doParallel"), .errorhandling = "remove") %dopar% {
+  source("~/Desktop/BIOD/brt.determine.R")
+  set.seed(1836)
+  ORDV[[i]] <- rbind(ORDV[[i]] %>% filter(we == 0) %>% mutate(fold = kfold(., 4)), ORDV[[i]] %>% filter(we != 0) %>% mutate(fold = kfold(., 4)))
+  alt <- foreach(j = 1:4, .packages = c("dismo", "gbm", "doParallel"), .errorhandling = "pass") %dopar% {
+  TRAIN <- ORDV[[i]] %>% filter(fold != j) %>% na.omit
+  TEST <- ORDV[[i]] %>% filter(fold == j) %>% na.omit
+  brt.determineR(TRAIN, TEST, 4:19, 3, LR, TC)
+  }
+  list(names(ORD)[i], alt)
+}
+```
+
+```{r}
+PARS <- cbind.data.frame(TC = c(10, 5, 10, 10, 10, 7, 10, 10, 3, 10, 10, 7), LR = c(0.005, 0.001, 0.001, 0.01, 0.001, 0.005, 0.005, 0.005, 0.01, 0.01, 0.005, 0.001))
+```
+Test the quality of the predictions of each model (and its parameters) and get predictions for each subset.
+```{r, eval = F}
+ODIF <- foreach(j = 1:length(ORDV), .packages = c("dismo", "gbm", "tidyverse", "raster", "viridis", "foreach", "magrittr", "doParallel"), .errorhandling = "remove") %dopar% {
+  set.seed(1836)
+  ORDV[[j]] <- rbind(ORDV[[i]] %>% filter(we == 0) %>% mutate(fold = kfold(., 4)), ORDV[[i]] %>% filter(we != 0) %>% mutate(fold = kfold(., 4)))
+  ODIF <- foreach(i = 1:4, .packages = c("dismo", "gbm", "tidyverse", "raster"), .combine = "rbind", .errorhandling = "pass") %dopar% {
+  TRAIN <- ORDV[[j]] %>% filter(fold != i) %>% na.omit
+  TEST <- ORDV[[j]] %>% filter(fold == i) %>% na.omit
+  set.seed(1876)
+  BRT <- gbm.step(data = TRAIN, gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = PARS[j, 1], learning.rate = PARS[j, 2], bag.fraction = 0.5, verbose = F, plot.main = F)
+  DIFF <- TEST %>% dplyr::select(x, y, we) %>% mutate(diff = we - predict(BRT, TEST, n.trees = BRT$gbm.call$best.trees), name = names(ORD)[j])  
+  DIFF
+  }
+  ODIF
+}
+```
+```{r, fig.width = 18, fig.height = 10}
+ODIF <- read.csv("~/Desktop/BIOD/order_diff_we.csv", header = T)
+ODIF %>% ggplot(aes(x = name, y = diff, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8)
+```
+```{r, fig.width = 18, fig.height = 24}
+DIFP <- foreach(i = 1:12, .packages = c("raster", "tidyverse")) %do% {
+  ODIF %>% filter(name == names(ORD)[i]) %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+}
+plot_grid(plotlist = DIFP, nrow = 4, labels = names(ORD))
+```
+
+
+Find the variable contribution to each order, lots of orders driving BIO4's importance. Elevation super important for rodents. Lagomorphs like CEC and NPP. Didelphimorphs like stable forest cover.
+```{r, fig.width = 18, fig.height = 10}
+OBRT <- foreach(j = 1:length(ORDV), .packages = c("dismo", "gbm", "tidyverse", "raster", "viridis", "foreach", "magrittr", "doParallel")) %dopar% {
+  brt <- gbm.step(data = na.omit(ORDV[[j]]), gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = PARS[j, 1], learning.rate = PARS[j, 2], bag.fraction = 0.5, verbose = F, plot.main = F)
+}
+CONTW <- cbind.data.frame(do.call(rbind, lapply(1:length(OBRT), function(x) OBRT[[x]]$contributions)), name = rep(names(ORD), each = 16))
+ggplot(CONTW, aes(x = var, y = rel.inf, fill = name)) + geom_histogram(stat = "identity", position = "dodge2") + scale_y_continuous(expand = c(0,0))
+CONTW %>% ggplot(aes(x = var, y = name, fill = rel.inf)) + geom_tile() + scale_fill_viridis_c()
+RESOR <- foreach(j = 1:length(ORDV), .packages = c("tidyverse", "viridis"), .combine = "rbind") %do% {
+  ORDV[[j]] %>% na.omit %>% mutate(residuals = OBRT[[j]]$residuals, name = names(ORD)[j])
+}
+RESOR %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8)
+```
+
+```{r, fig.width = 18, fig.height = 24}
+RESO <- lapply(names(ORD), function(j) RESOR %>% filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = RESO, nrow = 4, labels = names(ORD))
+```
+
+# Phylogenetic Endemism - all mammals {.tabset}
+
+## GLM
+Create the models. Check out a model using all the variables and a histogram of PE. 
+```{r}
+DATA <- cbind.data.frame(coordinates(VARS), pe = getValues(PE$PD_raster), getValues(VARS))
+DATA <- DATA[-which(is.na(DATA$pe)), ]
+DATA %>% ggplot(aes(pe)) + geom_density()
+```
+
+Density plot shows a skewed distribution
+
+```{r, results = "hide", message = F}
+rownames(DATA) <- 1:nrow(DATA)
+set.seed(3)
+DATA %<>% mutate(fold = kfold(DATA, k = 5))
+TEST <- DATA %>% filter(fold == 5)
+```
+```{r, eval = F}
+OUT <- foreach(i = 1:4, .packages = c("tidyverse", "glmulti", "Metrics"), .export = "DATA") %do% {
+TRAIN <- DATA %>% dplyr::filter(fold != i & fold != 5)
+VALID <- DATA %>% dplyr::filter(fold == i)
+lmout <- glmulti::glmulti(pe ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = TRAIN, level = 1, crit = "aicc", confsetsize = 5, method = "h", plotty = F, report = F)
+pred <- lapply(1:length(lmout@objects), function(x) predict(lmout@objects[[x]], VALID))
+RME <- sapply(pred, function(x) rmse(VALID$pe[-which(is.na(x))], x[-which(is.na(x))]))
+cbind(weightable(lmout), RME)
+}
+OUT
+unique(sapply(OUT, "[[", 1)[1, ])
+```
+Looks like all variables considered is considered the best model here as well (with some of the highly correlated variables that I will likely eventually get rid of being shunted off in some of the chosen formulas)
+
+```{r, fig.width = 12, fig.height = 10}
+TST <- predict(glm(pe ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = DATA %>% filter(fold != 5)), TEST) 
+RME <- rmse(TEST$pe[-which(is.na(TST))], TST[-which(is.na(TST))])
+RME
+DATA %<>% mutate(block = kfold(DATA, k = 4))
+DIFG <- foreach(i = 1:4, .combine = "rbind") %do% {
+  TRAIN <- DATA %>% filter(block != i)
+  TEST <- DATA %>% filter(block == i)
+  GLM <- glm(pe ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = TRAIN)
+  pred <- predict(GLM, TEST)
+  TEST %>% select(x, y, pe) %>% mutate(diff = pe - pred)
+}
+DIFG %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+GLM <- glm(pe ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = DATA)
+summary(GLM)
+balt <- DATA %>% mutate(residuals = NA)
+balt[names(GLM$residuals), "residuals"] <- GLM$residuals
+balt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+
+Not as dire as some of the SR GLMs, I guess
+
+## Spatial Regression Models (`package::spdep`)
+Take a look at spatial correlelograms for the residuals over a variety of distance classes (can see distinct spatial autocorrelation at lower distance classes). Then use `knearneigh` with a k = 1 to find minimum distance between neighbors to use that in `dnearneigh`. This is used to create a spatial regression model of the best determined model as determined by `glmulti`.
+```{r, fig.width = 12, fig.height = 10, warning=F}
+COR <- correlog(x = balt$x, y = balt$y, z = balt$residuals, increment = 10, resamp = 100, latlon = T, na.rm = T)
+plot(COR)
+KNN <- knearneigh(as.matrix(balt[, 1:2]), longlat = T)
+DIST <- sapply(1:length(KNN$nn), function(x) spDists(t(as.matrix(KNN$x[x, ])), t(as.matrix(KNN$x[KNN$nn[x, ], ])), longlat = T)) #`as.matrix` will give one column and the function needs two so the use of `t` is needed
+DNN <- dnearneigh(as.matrix(balt[, 1:2]), d1 = min(DIST), d2 = max(DIST), longlat = T)
+#plot(DNN, as.matrix(balt[, 1:2]))
+NBL <- nb2listw(DNN)
+ELM <- errorsarlm(GLM$formula, data = balt, listw = NBL)
+summary(ELM)
+balt[names(ELM$residuals), "residuals"] <- ELM$residuals
+balt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+#DIFF <- SRA - predict(VARS, ELM, ext = EXT)
+#DIFF %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+```
+
+Hmmm, not sure if there is a huge difference here.
+
+## Boosted regression trees
+Use the random fold selection for cross validation (spatially independent blocks runs into problems later in analyzing each order separately - probably sample size - and it returns better values - not as affected by spatial autocorrelation?) 
+```{r, fig.width = 12, fig.height = 10}
+#source("~/Desktop/BIOD/get.blocks.R")
+#BLOCK <- get.blocksR(DATA)
+#DATA %<>% mutate(block = BLOCK)
+#DATA %<>% mutate(block = kfold(DATA, k = 4))
+TRAIN <- DATA %>% filter(block != 1) %>% na.omit
+#TEST <- DATA %>% filter(block == 1) %>% na.omit
+LR <- c(0.1, 0.05, 0.01, 0.005, 0.001)
+TC <- c(1, 2, 3, 5, 7, 10)
+source("~/Desktop/BIOD/BoostedRegressionTreesFunction.R")
+DATA %>% ggplot(aes(x = x, y = y, fill = block)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+#BLEX <- DATA %>% filter(block == 1) %>% extent
+```
+```{r, eval = F}
+cl <- makeCluster(4, "SOCK")
+registerDoSNOW(cl)
+DEVI <- foreach(j = 1:4, .packages = c("dismo", "gbm", "doParallel", "tidyverse"), .errorhandling = "pass") %dopar% {
+  TRAIN <- DATA %>% filter(block != j) %>% na.omit
+  TEST <- DATA %>% filter(block == j) %>% na.omit
+  brt.determine(TRAIN, TEST, 4:19, 3, LR, TC)
+  }
+```
+
+Tree complexity is best set at 7 minimize deviance with a learning rate of 0.01.
+
+Looking at the differences in predicted SR across CA, the BRT does pretty well! Adding elevation variables fixed the problems with overrepresenting the coasts and underepresenting the highlands. There are a few islands and some areas of Panama that don't work with the model, but I assume they may have low SR but similar environmental values as the cells around them. These predicted outliers could be due to biogeographic or historical reasons (e.g., islands or filter barriers).
+```{r, fig.width=12, fig.height =10}
+set.seed(3)
+DIFF <- foreach(i = 1:4, .packages = c("dismo", "gbm", "tidyverse", "raster"), .combine = "rbind") %do% {
+  TRAIN <- na.omit(filter(DATA, block != i))
+  TEST <- na.omit(filter(DATA, block == i))
+  #BLEX <- DATA %>% filter(block == i) %>% extent
+  BRT <- gbm.step(data = TRAIN, gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = 7, learning.rate = 0.01, bag.fraction = 0.5, verbose = F, plot.main = F )
+  DIFF <- TEST %>% select(x, y, pe) %>% mutate(diff = pe - predict(BRT, TEST, n.trees = BRT$gbm.call$best.trees))  
+  DIFF
+}
+#DIFF <- do.call(merge, DIFF) 
+DIFF %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+```
+
+Create a model using the full dataset, look at the spatial patterns of the residuals, and assess the contributions of each variable. The residuals vary less than the GLM and the SRM. It seems that the most important variables are bio4 (temperature seasonality), distance to water, elevation and TRI.
+
+```{r, fig.width = 14, fig.height = 10}
+BRT <- gbm.step(data = na.omit(DATA), gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = 7, learning.rate = 0.01, bag.fraction = 0.5, verbose = F, plot.main = F)
+BRT$contributions
+BRT$contributions %>% ggplot(aes(x = var, y = rel.inf)) + geom_histogram(stat = "identity") 
+boxplot(BRT$residuals)
+DATA %>% na.omit %>% mutate(residuals = BRT$residuals) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+```
+
+Note that the residuals don't seem to show any obvious spatial pattern as seen in the GLMs and SARs. 
+
+# Phylogenetic Endemism - separate orders {.tabset}
+## Pearson correlation
+```{r}
+colnames(SAMP) <- gsub(" ", "_", colnames(SAMP)) #changes species names in the community matrix to match with the tree tip names
+ORD <- lapply(levels(RANGE$order_name), function(x) RANGE %>% filter(order_name == x) %$% binomial %>% as.character %>% unique)
+names(ORD) <- levels(RANGE$order_name)
+ORD <- compact(ORD)
+ORD <- lapply(ORD, function(i) gsub(" ", "_", i))
+#colnames(SAMP) <- sapply(strsplit(colnames(SAMP), "_"), paste, collapse = " ")
+```
+```{r, results = "hide"}
+ORDS <- lapply(ORD, function(j) phylogenetic.endemism(data.frame(SAMP[, colnames(SAMP) %in% j]), records = "site", site.coords = coordinates(RAST), longitude = "x", latitude = "y", sep.comm.spp = "_", phylo.tree = TREE$mammalST_MSW05_bestDates, sep.phylo.spp = "_", frame.raster = RAST, pe.type = "weighted", plot.raster = F))
+for(i in 1:12) {
+  calt <- ORDS[[i]]$PD_raster
+  calt[setdiff(which(!is.na(PE$PD_raster[])), which(!is.na(calt[])))] <- 0 
+  ORDS[[i]]$PD_raster <- calt
+}
+```
+```{r, fig.width = 24, fig.height = 18}
+ORDP <- lapply(ORDS, function(x) x %$% PD_raster %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_viridis() + coord_fixed()) 
+plot_grid(plotlist = ORDP, nrow = 4, labels = names(ORD))
+```
+
+Check for correlation among the orders. Only thing is that Cingulata is correlated with Pilosa.
+```{r}
+layerStats(stack(lapply(ORDS, function(x) x %$% PD_raster)), "pearson", na.rm = T)
+```
+
+## GLMs
+Run `glmulti` for each separate group to find the best model for each (again overfitting may be a problem, so we may have to constrain it somehow). Check out the AICc weight table to see which of the retained models are best.
+```{r, message = F, fig.width = 18, fig.height=30}
+ORDV <- lapply(1:length(ORDS), function(x) cbind.data.frame(coordinates(ORDS[[x]]$PD_raster), pe = getValues(ORDS[[x]]$PD_raster), getValues(VARS)))
+DENS <- lapply(ORDV, function(i) i %>% ggplot(aes(pe)) + geom_density())
+plot_grid(plotlist = DENS, nrow = 4)
+ORDV <- lapply(1:length(ORDV), function(x) ORDV[[x]][-NANUM, ])
+GLM <- foreach(i = 1:length(ORDV), .packages = "glmulti") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[1]])
+  glmulti(pe ~ bio1 + bio2 + bio4 + bio12 + bio15 + distwater + CEC + staticforest + dynforest + forest + npp + elev + slope + tri + roughness, data = ORDV[[i]], level = 1, crit = "aicc", confsetsize = 5, method = "h", plotty = F, report = F)
+}
+lapply(GLM, weightable)
+```
+
+Run the models determined by `glmulti` and plot the residuals to check out the spatial patterns within them.
+```{r, fig.width = 18, fig.height = 10, warning = F}
+PLTV <- foreach(i = 1:length(GLM), .packages = c("tidyverse"), .combine = "rbind") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA, name = names(ORD)[i])
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  #calt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+  calt
+}
+PLTV %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8) + scale_y_continuous(breaks = seq(-3, 12, 1))
+```
+
+```{r, fig.width = 24, fig.height = 18}
+PLTV <- lapply(names(ORD), function(j) PLTV %>% filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = PLTV, nrow = 4, labels = names(ORD))
+```
+
+## Spatial regression models
+Most groups again have spatial autocorrelation at short distances (unlike what we see with PE of all mammals).
+
+```{r, fig.width = 18, fig.height = 24, warning = F}
+CORL <- foreach(i = 1:length(GLM), .packages = c("tidyverse", "ncf")) %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA)
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  correlog(x = calt$x, y = calt$y, z = calt$residuals, increment = 10, resamp = 100, latlon = T, na.rm = T)
+}
+par(mfrow = c(4, 3))
+for(i in 1:12) {
+  plot(CORL[[i]])
+}
+par(mfrow = c(1, 1))
+#sapply(CORL, plot)
+```
+
+Create SARs for each order given the best model determined by `glmulti`. Also, give the summary of each SAR to see which variables are significant for each order. 
+```{r, fig.width = 18, fig.height = 10, warning = F}
+ELMO <- foreach(i = 1:length(GLM), .packages = c("tidyverse", "ncf", "spdep")) %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA)
+  calt[names(GLM[[i]]@objects[[1]]$residuals), "residuals"] <- GLM[[i]]@objects[[1]]$residuals
+  errorsarlm(GLM[[i]]@objects[[1]]$formula, data = calt, listw = NBL)
+}
+lapply(ELMO, summary)
+
+ELPL <- foreach(i = 1:length(ELMO), .packages = c("tidyverse", "viridis", "spdep"), .combine = "rbind") %do% {
+  rownames(ORDV[[i]]) <- 1:nrow(ORDV[[i]])
+  calt <- ORDV[[i]] %>% mutate(residuals = NA, name = names(ORD)[i])
+  calt[names(ELMO[[i]]$residuals), "residuals"] <- ELMO[[i]]$residuals
+  #calt %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed()
+  calt
+}
+ELPL %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8) + scale_y_continuous(breaks = seq(-3, 12, 1))
+```
+
+```{r, fig.width = 18, fig.height = 24}
+ELPL <- lapply(names(ORD), function(j) ELPL %>% dplyr::filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = ELPL, nrow = 4, labels = names(ORD))
+```
+
+```{r, fig.width = 18, fig.height = 24, warning = F}
+DIFFO <- foreach(i = 1:length(ELMO), .packages = c("tidyverse", "viridis", "raster")) %do% {
+  diff <- ORDR[[i]] - predict(VARS, ELMO[[i]], ext = EXT)
+  diff %>% rasterToPoints %>% as.data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+}
+plot_grid(plotlist = DIFFO, nrow = 4, labels = names(ORD))
+```
+
+## Boosted regression trees
+Train the models using random fold cross validation and determine the appropriate parameters.
+```{r}
+cl <- makeCluster(7, "SOCK")
+registerDoSNOW(cl)
+```
+```{r, eval = F}
+alt <- foreach(i = 1:12, .packages = c("tidyverse", "magrittr", "dismo", "gbm", "doParallel"), .errorhandling = "remove") %dopar% {
+  source("~/Desktop/BIOD/brt.determine.R")
+  set.seed(1836)
+  ORDV[[i]] <- rbind(ORDV[[i]] %>% filter(pe == 0) %>% mutate(fold = kfold(., 4)), ORDV[[i]] %>% filter(pe != 0) %>% mutate(fold = kfold(., 4)))
+  alt <- foreach(j = 1:4, .packages = c("dismo", "gbm", "doParallel"), .errorhandling = "pass") %dopar% {
+  TRAIN <- ORDV[[i]] %>% filter(fold != 1) %>% na.omit
+  TEST <- ORDV[[i]] %>% filter(fold == 1) %>% na.omit
+  brt.determine(TRAIN, TEST, 4:19, 3, LR, TC)
+  }
+  list(names(ORD)[i], alt)
+}
+```
+
+Redid the `brt.determine` function to fix some of the issues that I have been having. Briefly, I changed it to catch a failed run result of null and added multiple `if` statements to fill in the blanks when that happened. Also, now the result of `brt.determine` is a data.frame.
+
+```{r}
+PARS <- cbind.data.frame(TC = c(10, 7, 10, 10, 3, 10, 10, 5, 5, 10, 10, 10), LR = c(0.005, 0.05, 0.01, 0.05, 0.001, 0.001, 0.005, 0.005, 0.05, 0.05, 0.005, 0.001))
+```
+Test the quality of the predictions of each model (and its parameters) and get predictions for each subset.
+```{r, eval = F}
+ODIF <- foreach(j = 1:length(ORDV), .packages = c("dismo", "gbm", "tidyverse", "raster", "viridis", "foreach", "magrittr", "doParallel"), .errorhandling = "remove") %dopar% {
+  source("~/Desktop/BIOD/get.blocks.R")
+  set.seed(1836)
+  ORDV[[j]] <- rbind(ORDV[[i]] %>% filter(pe == 0) %>% mutate(fold = kfold(., 4)), ORDV[[i]] %>% filter(pe != 0) %>% mutate(fold = kfold(., 4)))
+  ODIF <- foreach(i = 1:4, .packages = c("dismo", "gbm", "tidyverse", "raster"), .combine = "rbind", .errorhandling = "pass") %dopar% {
+  TRAIN <- ORDV[[j]] %>% filter(fold != i) %>% na.omit
+  TEST <- ORDV[[j]] %>% filter(fold == i) %>% na.omit
+  set.seed(1876)
+  BRT <- gbm.step(data = TRAIN, gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = PARS[j, 1], learning.rate = PARS[j, 2], bag.fraction = 0.5, verbose = F, plot.main = F)
+  DIFF <- TEST %>% dplyr::select(x, y, pe) %>% mutate(diff = pe - predict(BRT, TEST, n.trees = BRT$gbm.call$best.trees))  
+  DIFF
+  }
+  ODIF
+}
+```
+```{r, fig.width = 18, fig.height = 10}
+ODIF <- read.csv("~/Desktop/BIOD/order_diff_pe.csv", header = T)
+ODIF %>% ggplot(aes(x = name, y = diff, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8) + scale_y_continuous(breaks = seq(-4, 12, 4))
+```
+```{r, fig.width = 18, fig.height = 24}
+DIFP <- foreach(i = 1:12, .packages = c("raster", "tidyverse")) %do% {
+  ODIF %>% filter(name == names(ORD)[i]) %>% ggplot(aes(x = x, y = y, fill = diff)) + geom_raster() + scale_fill_gradient2(low = "red", high = "darkcyan", na.value = NA, name = "Difference") + coord_fixed()
+}
+plot_grid(plotlist = DIFP, nrow = 4, labels = names(ORD))
+```
+
+
+Find the variable contribution to each order, lots of orders driving BIO4's importance. Elevation super important for rodents. Lagomorphs like CEC and NPP. Didelphimorphs like stable forest cover.
+```{r, fig.width = 18, fig.height = 10}
+OBRT <- foreach(j = 1:length(ORDV), .packages = c("dismo", "gbm", "tidyverse", "raster", "viridis", "foreach", "magrittr", "doParallel")) %dopar% {
+  brt <- gbm.step(data = na.omit(ORDV[[j]]), gbm.x = 4:19, gbm.y = 3, family = "gaussian", tree.complexity = PARS[j, 1], learning.rate = PARS[j, 2], bag.fraction = 0.5, verbose = F, plot.main = F)
+}
+CONTE <- cbind.data.frame(do.call(rbind, lapply(1:length(OBRT), function(x) OBRT[[x]]$contributions)), name = rep(names(ORD), each = 16))
+ggplot(CONTE, aes(x = var, y = rel.inf, fill = name)) + geom_histogram(stat = "identity", position = "dodge2") + scale_y_continuous(expand = c(0,0))
+CONTE %>% ggplot(aes(x = var, y = name, fill = rel.inf)) + geom_tile() + scale_fill_viridis_c()
+RESOR <- foreach(j = 1:length(ORDV), .packages = c("tidyverse", "viridis"), .combine = "rbind") %do% {
+  ORDV[[j]] %>% na.omit %>% mutate(residuals = OBRT[[j]]$residuals, name = names(ORD)[j])
+}
+RESOR %>% ggplot(aes(x = name, y = residuals, fill = name, color = name)) + geom_point(position = position_jitter(width = 0.15), size = 0.45) + geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.1, color = "black", size = 0.8)
+```
+
+```{r, fig.width = 18, fig.height = 24}
+RESO <- lapply(names(ORD), function(j) RESOR %>% filter(name == j) %>% ggplot(aes(x = x, y = y, fill = residuals)) + geom_raster() + scale_fill_viridis() + coord_fixed())
+plot_grid(plotlist = RESO, nrow = 4, labels = names(ORD))
+```
+
+PE is overall a lot harder to model than SR. It gets it about right for most orders, but bats and rodents are testy cases where it can't figure them out on a pixel by pixel basis (likely due to something else that restricts them to these areas?).
+
+```{r}
+CONTS %<>% mutate(type = "sr")
+CONTD %<>% mutate(type = "pd")
+CONTE %<>% mutate(type = "pe")
+CONT <- rbind(CONTS, CONTD, CONTE)
+CONT %>% mutate(cat = paste(.$name, .$type, sep = "_")) %>% ggplot(aes(x = cat, y = var, alpha = rel.inf, fill = type)) + geom_tile(color = "white", size = 0.8) + scale_fill_viridis_d()
+```
+
+```{r, eval = F}
+PBORD <- crop(BORD, EXT)
+PLTS <- lapply(list(SRA, log(PD$PD_raster), WE$WE_raster, PE$PD_raster), function(j) j %>% rasterToPoints() %>% data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_tile() + scale_fill_viridis_c() + geom_polygon(data = PBORD, aes(x = long, y = lat, group = group), fill = NA, color = "grey40", size = 0.20) + geom_contour(aes(z = layer), breaks = quantile(j, 0.8, na.rm = T), color = "white", size = 1) + coord_fixed() + theme(axis.text =  element_text(size = 11, face = "bold", color = "grey50"), axis.title = element_blank(), panel.background = element_rect(fill = "grey90", color = "grey50")) + guides(fill = guide_colorbar(barwidth = 1.25, barheight = 10, title.position = "top", direction = "vertical", ticks = F)))
+
+plot_grid(plotlist = PLTS, labels = c("A", "B", "C", "D"), nrow = 2, label_size = 14)
+```
